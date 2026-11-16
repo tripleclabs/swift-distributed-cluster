@@ -43,3 +43,7 @@ public struct ClusterActorID: Hashable, Codable, Sendable, CustomStringConvertib
         "\(node)/\(path):\(incarnation)"
     }
 }
+
+internal struct WeakActorBox: Sendable {
+    weak let actor: any DistributedActor?
+}

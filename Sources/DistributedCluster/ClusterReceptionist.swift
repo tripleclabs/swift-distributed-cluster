@@ -14,10 +14,6 @@ public enum Reception {
 }
 
 public final class ClusterReceptionist: Sendable {
-    internal struct WeakActorBox: Sendable {
-        weak let actor: any DistributedActor?
-    }
-
     internal struct WeakSystemBox: Sendable {
         weak let system: ClusterSystem?
     }
@@ -25,7 +21,7 @@ public final class ClusterReceptionist: Sendable {
     internal struct State {
         var local: [String: [ClusterActorID: WeakActorBox]] = [:]
         var remote: [String: Set<ClusterActorID>] = [:]
-        var subscribers: [String: [UUID: @Sendable (Set<ClusterActorID>) -> Void]] = [:]
+        var subscribers: [String: [UUID: @Sendable () -> Void]] = [:]
         var systemBox: WeakSystemBox?
     }
 
@@ -74,9 +70,9 @@ public final class ClusterReceptionist: Sendable {
                 result.insert(casted)
             }
         }
-        if let system {
+        if let actorSystem = system as? Act.ActorSystem {
             for id in remoteIDs {
-                if let resolved = try? system.resolve(id: id, as: Act.self) {
+                if let resolved = try? Act.resolve(id: id, using: actorSystem) {
                     result.insert(resolved)
                 }
             }
@@ -90,28 +86,39 @@ public final class ClusterReceptionist: Sendable {
     ) -> AsyncStream<Set<Act>> where Act.ID == ClusterActorID {
         let subscriberID = UUID()
         let (stream, continuation) = AsyncStream<Set<Act>>.makeStream()
+        let (triggerStream, triggerContinuation) = AsyncStream<Void>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+
         state.withLock { s in
             var subs = s.subscribers[key.id] ?? [:]
-            subs[subscriberID] = { [weak self] _ in
-                guard let self else { return }
-                Swift::Task {
-                    let current = await self.lookup(key, as: actorType)
-                    continuation.yield(current)
-                }
+            subs[subscriberID] = {
+                triggerContinuation.yield(())
             }
             s.subscribers[key.id] = subs
         }
-        continuation.onTermination = { [weak self] _ in
-            guard let self else { return }
-            self.state.withLock { s in
-                _ = s.subscribers[key.id]?.removeValue(forKey: subscriberID)
+
+        let consumerTask = Swift::Task { [weak self] in
+            for await _ in triggerStream {
+                guard let self else { break }
+                let current = await self.lookup(key, as: actorType)
+                continuation.yield(current)
             }
         }
-        Swift::Task { [weak self] in
+
+        continuation.onTermination = { [weak self] _ in
+            triggerContinuation.finish()
+            consumerTask.cancel()
             guard let self else { return }
-            let current = await self.lookup(key, as: actorType)
-            continuation.yield(current)
+            self.state.withLock { s in
+                s.subscribers[key.id]?.removeValue(forKey: subscriberID)
+                if s.subscribers[key.id]?.isEmpty == true {
+                    s.subscribers.removeValue(forKey: key.id)
+                }
+            }
         }
+
+        triggerContinuation.yield(())
         return stream
     }
 
@@ -120,6 +127,9 @@ public final class ClusterReceptionist: Sendable {
             var changed: [String] = []
             for keyID in Array(s.local.keys) {
                 if s.local[keyID]?.removeValue(forKey: id) != nil {
+                    if s.local[keyID]?.isEmpty == true {
+                        s.local.removeValue(forKey: keyID)
+                    }
                     changed.append(keyID)
                 }
             }
@@ -135,6 +145,41 @@ public final class ClusterReceptionist: Sendable {
         }
     }
 
+    internal func removeRemoteActors(on deadNode: Cluster.Node) {
+        let changedKeys = state.withLock { s -> [String] in
+            var changed: [String] = []
+            for keyID in Array(s.remote.keys) {
+                guard var ids = s.remote[keyID] else { continue }
+                let before = ids.count
+                ids = ids.filter { $0.node != deadNode }
+                if ids.count != before {
+                    if ids.isEmpty {
+                        s.remote.removeValue(forKey: keyID)
+                    } else {
+                        s.remote[keyID] = ids
+                    }
+                    changed.append(keyID)
+                }
+            }
+            return changed
+        }
+        for keyID in changedKeys {
+            notifySubscribers(keyID: keyID)
+        }
+    }
+
+    internal func allLocalRegistrations() -> [(keyID: String, actorID: ClusterActorID)] {
+        state.withLock { s in
+            var items: [(String, ClusterActorID)] = []
+            for (keyID, entries) in s.local {
+                for (actorID, box) in entries where box.actor != nil {
+                    items.append((keyID, actorID))
+                }
+            }
+            return items
+        }
+    }
+
     internal func applyRemoteSync(keyID: String, actorID: ClusterActorID, removed: Bool) {
         state.withLock { s in
             var ids = s.remote[keyID] ?? []
@@ -143,26 +188,21 @@ public final class ClusterReceptionist: Sendable {
             } else {
                 ids.insert(actorID)
             }
-            s.remote[keyID] = ids
+            if ids.isEmpty {
+                s.remote.removeValue(forKey: keyID)
+            } else {
+                s.remote[keyID] = ids
+            }
         }
         notifySubscribers(keyID: keyID)
     }
 
     internal func notifySubscribers(keyID: String) {
-        let (subs, ids) = state.withLock { s -> ([UUID: @Sendable (Set<ClusterActorID>) -> Void], Set<ClusterActorID>) in
-            var all = Set<ClusterActorID>()
-            if let entries = s.local[keyID] {
-                for (actorID, box) in entries where box.actor != nil {
-                    all.insert(actorID)
-                }
-            }
-            if let remoteIDs = s.remote[keyID] {
-                all.formUnion(remoteIDs)
-            }
-            return (s.subscribers[keyID] ?? [:], all)
+        let subs = state.withLock { s -> [UUID: @Sendable () -> Void] in
+            s.subscribers[keyID] ?? [:]
         }
         for (_, handler) in subs {
-            handler(ids)
+            handler()
         }
     }
 }

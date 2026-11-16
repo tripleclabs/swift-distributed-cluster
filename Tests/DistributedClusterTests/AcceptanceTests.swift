@@ -1,5 +1,5 @@
 import Distributed
-import DistributedCluster
+@testable import DistributedCluster
 import Foundation
 import Testing
 
@@ -7,11 +7,19 @@ struct WorkerProblem: Error, Codable, Equatable, Sendable {
     let message: String
 }
 
+struct NonCodableProblem: Error, Sendable {
+    let detail: String
+}
+
 distributed actor EchoWorker {
     typealias ActorSystem = ClusterSystem
 
     distributed func ping(_ message: String) -> String {
         "pong:\(message)"
+    }
+
+    distributed func echoGeneric<T: Codable & Sendable>(_ value: T) -> T {
+        value
     }
 
     distributed func notifyOnly(_ value: Int) {
@@ -33,6 +41,10 @@ distributed actor EchoWorker {
 
     distributed func failCustom(_ message: String) throws -> String {
         throw WorkerProblem(message: message)
+    }
+
+    distributed func failNonCodable(_ detail: String) throws -> String {
+        throw NonCodableProblem(detail: detail)
     }
 
     distributed func failCluster() throws -> String {
@@ -197,7 +209,7 @@ struct DistributedClusterAcceptanceTests {
             correlationID: 0x0102_0304_0506_0708,
             payloadLength: 1024
         )
-        let encoded: InlineArray<15, UInt8> = original.encode()
+        let encoded: InlineArray<16, UInt8> = original.encode()
 
         let decoded = try WireHeader.decode(from: encoded.span.bytes)
         #expect(decoded == original)
@@ -303,13 +315,20 @@ struct DistributedClusterAcceptanceTests {
 
         do {
             _ = try await proxy.failCustom("boom")
-            Issue.record("Expected custom error to be thrown")
+            Issue.record("Expected WorkerProblem to be thrown")
+        } catch let error as WorkerProblem {
+            #expect(error == WorkerProblem(message: "boom"))
+        }
+
+        do {
+            _ = try await proxy.failNonCodable("unstructured")
+            Issue.record("Expected fallback ClusterError to be thrown")
         } catch let error as ClusterError {
             guard case .decodingFailed(let message) = error else {
-                Issue.record("Expected decodingFailed wrapping remote error, got \(error)")
+                Issue.record("Expected decodingFailed wrapping non-Codable error, got \(error)")
                 return
             }
-            #expect(message.contains("boom"))
+            #expect(message.contains("unstructured"))
         }
 
         do {
@@ -577,8 +596,12 @@ struct DistributedClusterAcceptanceTests {
         badMagic[0] = 0xFF
         #expect(throws: ClusterError.self) { try WireHeader.decode(from: badMagic.span.bytes) }
 
+        var badVersion = valid.encode()
+        badVersion[2] = 99
+        #expect(throws: ClusterError.self) { try WireHeader.decode(from: badVersion.span.bytes) }
+
         var badType = valid.encode()
-        badType[2] = 0xFF
+        badType[3] = 0xFF
         #expect(throws: ClusterError.self) { try WireHeader.decode(from: badType.span.bytes) }
 
         let oversized = WireHeader(type: .reply, correlationID: 1, payloadLength: WireHeader.maxPayloadLength + 1)
@@ -615,6 +638,228 @@ struct DistributedClusterAcceptanceTests {
         let nodeData = try JSONEncoder().encode(node)
         #expect(try JSONDecoder().decode(Cluster.Node.self, from: nodeData) == node)
     }
+
+    @Test("Cross-node Receptionist lookup, seedNodes initial sync, and eviction on node down")
+    func crossNodeReceptionistSyncAndEviction() async throws {
+        let nodeA = try await ClusterSystem("rec-a") { $0.bindPort = 19322 }
+        defer { await nodeA.shutdown() }
+
+        let key = Reception.Key("remote-workers", as: EchoWorker.self)
+        let workerOnA = EchoWorker(actorSystem: nodeA)
+        await nodeA.receptionist.register(workerOnA, with: key)
+
+        let nodeB = try await ClusterSystem("rec-b") {
+            $0.bindPort = 19323
+            $0.seedNodes = [Cluster.Endpoint(host: "127.0.0.1", port: 19322)]
+        }
+        defer { await nodeB.shutdown() }
+
+        let streamB = nodeB.receptionist.listing(of: key)
+        #expect(await listingContains(streamB, id: workerOnA.id))
+
+        let resolved = await nodeB.receptionist.lookup(key)
+        let remoteProxy = try #require(resolved.first(where: { $0.id == workerOnA.id }))
+        #expect(try await remoteProxy.ping("via-receptionist") == "pong:via-receptionist")
+
+        await nodeA.shutdown()
+        #expect(await listingEventuallyEmpty(streamB))
+        let afterDown = await nodeB.receptionist.lookup(key)
+        #expect(afterDown.isEmpty)
+    }
+
+    @Test("Caller Task cancellation aborts in-flight remoteCall promptly")
+    func callerTaskCancellationAbortsRemoteCall() async throws {
+        let caller = try await ClusterSystem("cancel-a") {
+            $0.bindPort = 19324
+            $0.requestTimeout = .seconds(10)
+        }
+        let workerNode = try await ClusterSystem("cancel-b") { $0.bindPort = 19325 }
+        defer {
+            await caller.shutdown()
+            await workerNode.shutdown()
+        }
+
+        let worker = EchoWorker(actorSystem: workerNode)
+        let proxy = try EchoWorker.resolve(id: worker.id, using: caller)
+
+        let start = ContinuousClock.now
+        let task = Task {
+            try await proxy.slowPing("cancel-me")
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        task.cancel()
+
+        let result = await task.result
+        let elapsed = ContinuousClock.now - start
+        #expect(elapsed < .seconds(2))
+        switch result {
+        case .success(let value):
+            Issue.record("Expected CancellationError, got \(value)")
+        case .failure(let error):
+            #expect(error is CancellationError)
+        }
+    }
+
+    @Test("Bidirectional concurrent RPCs between two nodes succeed")
+    func bidirectionalConcurrentRPC() async throws {
+        let nodeA = try await ClusterSystem("bidi-a") { $0.bindPort = 19326 }
+        let nodeB = try await ClusterSystem("bidi-b") { $0.bindPort = 19327 }
+        defer {
+            await nodeA.shutdown()
+            await nodeB.shutdown()
+        }
+
+        let workerA = EchoWorker(actorSystem: nodeA)
+        let workerB = EchoWorker(actorSystem: nodeB)
+        let proxyBOnA = try EchoWorker.resolve(id: workerB.id, using: nodeA)
+        let proxyAOnB = try EchoWorker.resolve(id: workerA.id, using: nodeB)
+
+        async let replyFromB = proxyBOnA.ping("from-a")
+        async let replyFromA = proxyAOnB.ping("from-b")
+
+        #expect(try await replyFromB == "pong:from-a")
+        #expect(try await replyFromA == "pong:from-b")
+    }
+
+    @Test("Generic distributed functions round-trip across nodes")
+    func genericDistributedFuncRoundTrip() async throws {
+        let nodeA = try await ClusterSystem("gen-a") { $0.bindPort = 19328 }
+        let nodeB = try await ClusterSystem("gen-b") { $0.bindPort = 19329 }
+        defer {
+            await nodeA.shutdown()
+            await nodeB.shutdown()
+        }
+
+        let worker = EchoWorker(actorSystem: nodeB)
+        let proxy = try EchoWorker.resolve(id: worker.id, using: nodeA)
+
+        #expect(try await proxy.echoGeneric("hello") == "hello")
+        #expect(try await proxy.echoGeneric([1, 2, 3]) == [1, 2, 3])
+        #expect(try await proxy.echoGeneric(WorkerProblem(message: "ok")) == WorkerProblem(message: "ok"))
+    }
+
+    @Test("Binary InvocationPayload, RemoteCallEnvelope, and BinaryCodec reject truncated inputs")
+    func binaryCodecAndEnvelopeEdgeCases() throws {
+        let node = Cluster.Node(name: "n1", endpoint: Cluster.Endpoint(host: "127.0.0.1", port: 2551), nid: 99)
+        let actorID = ClusterActorID(node: node, path: "Worker-1", incarnation: 7)
+
+        let payload = InvocationPayload(
+            targetIdentifier: "ping(_:)",
+            genericSubstitutions: [_mangledTypeName(String.self) ?? ""],
+            arguments: [Data("arg1".utf8)],
+            returnType: _mangledTypeName(Int.self) ?? "",
+            errorType: _mangledTypeName(WorkerProblem.self) ?? ""
+        )
+        let encodedPayload = try payload.encodeBinary()
+        let decodedPayload = try InvocationPayload.decodeBinary(from: encodedPayload)
+        #expect(decodedPayload.targetIdentifier == payload.targetIdentifier)
+        #expect(decodedPayload.genericSubstitutions == payload.genericSubstitutions)
+        #expect(decodedPayload.arguments == payload.arguments)
+        #expect(decodedPayload.returnType == payload.returnType)
+        #expect(decodedPayload.errorType == payload.errorType)
+
+        let envelope = RemoteCallEnvelope(targetID: actorID, invocationData: encodedPayload)
+        let encodedEnvelope = try envelope.encodeBinary()
+        let decodedEnvelope = try RemoteCallEnvelope.decodeBinary(from: encodedEnvelope)
+        #expect(decodedEnvelope.targetID == actorID)
+        #expect(decodedEnvelope.invocationData == encodedPayload)
+
+        // Truncated InvocationPayload and RemoteCallEnvelope inputs must fail cleanly.
+        for prefixLength in [0, 1, 5, encodedPayload.count - 1] {
+            #expect(throws: ClusterError.self) {
+                try InvocationPayload.decodeBinary(from: encodedPayload.prefix(prefixLength))
+            }
+        }
+        for prefixLength in [0, 4, 16, encodedEnvelope.count - encodedPayload.count - 1] {
+            #expect(throws: ClusterError.self) {
+                try RemoteCallEnvelope.decodeBinary(from: encodedEnvelope.prefix(prefixLength))
+            }
+        }
+    }
+
+    @Test("ClusterInvocationDecoder handles generic, return, error types and failure paths")
+    func invocationDecoderEdgeCases() throws {
+        let validPayload = InvocationPayload(
+            targetIdentifier: "op()",
+            genericSubstitutions: [_mangledTypeName(Int.self) ?? ""],
+            arguments: [try JSONEncoder().encode("hello")],
+            returnType: _mangledTypeName(String.self) ?? "",
+            errorType: _mangledTypeName(WorkerProblem.self) ?? ""
+        )
+        var decoder = ClusterInvocationDecoder(payload: validPayload)
+        let subs = try decoder.decodeGenericSubstitutions()
+        #expect(subs.count == 1)
+        #expect(subs.first == Int.self)
+        #expect(try decoder.decodeReturnType() == String.self)
+        #expect(try decoder.decodeErrorType() == WorkerProblem.self)
+        let arg: String = try decoder.decodeNextArgument()
+        #expect(arg == "hello")
+
+        // Exhausted arguments throws.
+        #expect(throws: ClusterError.self) {
+            let _: String = try decoder.decodeNextArgument()
+        }
+
+        // Unknown generic substitution throws.
+        var badSubDecoder = ClusterInvocationDecoder(payload: InvocationPayload(
+            targetIdentifier: "op()",
+            genericSubstitutions: ["NotARealMangledTypeName"],
+            arguments: [],
+            returnType: "",
+            errorType: ""
+        ))
+        #expect(throws: ClusterError.self) {
+            try badSubDecoder.decodeGenericSubstitutions()
+        }
+        #expect(try badSubDecoder.decodeReturnType() == nil)
+        #expect(try badSubDecoder.decodeErrorType() == nil)
+
+        // Corrupt error frame data falls back to ClusterError.decodingFailed.
+        let fallback = decodeThrownError(from: Data("not-json".utf8))
+        guard let clusterErr = fallback as? ClusterError, case .decodingFailed = clusterErr else {
+            Issue.record("Expected ClusterError.decodingFailed fallback, got \(fallback)")
+            return
+        }
+    }
+
+    #if SWIMDiscovery
+    @Test("SWIMDiscovery tracks peer membership and removes dead nodes")
+    func swimDiscoveryTracksMembershipAndRemoval() async throws {
+        let nodeA = try await ClusterSystem("swim-a") {
+            $0.bindPort = 19330
+            $0.swim.probeInterval = .milliseconds(100)
+        }
+        defer { await nodeA.shutdown() }
+
+        let nodeB = try await ClusterSystem("swim-b") {
+            $0.bindPort = 19331
+            $0.seedNodes = [Cluster.Endpoint(host: "127.0.0.1", port: 19330)]
+            $0.swim.probeInterval = .milliseconds(100)
+        }
+        defer { await nodeB.shutdown() }
+
+        var discovered = false
+        for _ in 0..<30 {
+            if nodeA.swimMembers.contains(nodeB.node) && nodeB.swimMembers.contains(nodeA.node) {
+                discovered = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(discovered)
+
+        await nodeB.shutdown()
+        var evicted = false
+        for _ in 0..<30 {
+            if !nodeA.swimMembers.contains(nodeB.node) {
+                evicted = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(evicted)
+    }
+    #endif
 }
 
 func expectNoTermination(_ supervisor: TestSupervisor, within duration: Duration) async throws -> Bool {

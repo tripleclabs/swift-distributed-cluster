@@ -3,6 +3,9 @@ import Foundation
 import Logging
 import ServiceLifecycle
 import Synchronization
+#if SWIMDiscovery
+import SWIM
+#endif
 
 public final class ClusterSystem: Distributed::DistributedActorSystem, Service, Sendable {
     public typealias ActorID = ClusterActorID
@@ -19,14 +22,13 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         public var heartbeatInterval: Duration = .seconds(2)
         public var heartbeatTimeout: Duration = .seconds(6)
         public var logger: Logger
+        #if SWIMDiscovery
+        public var swim: SWIM.Settings = SWIM.Settings()
+        #endif
 
         public init(nodeName: String) {
             self.logger = Logger(label: "cluster.\(nodeName)")
         }
-    }
-
-    internal struct WeakActorBox: Sendable {
-        weak let actor: any DistributedActor?
     }
 
     internal struct WeakWatcherBox: Sendable {
@@ -56,6 +58,13 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
 
     internal let state = Mutex(State())
     internal let transport: ClusterTransport
+    #if SWIMDiscovery
+    internal let swimAdapter: SWIMMembershipAdapter
+
+    public var swimMembers: [Cluster.Node] {
+        swimAdapter.members()
+    }
+    #endif
     internal let terminatedContinuation: AsyncStream<Void>.Continuation
     public let terminated: AsyncStream<Void>
 
@@ -78,6 +87,9 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         self.terminatedContinuation = continuation
         self.receptionist = ClusterReceptionist(localNode: self.node)
         self.transport = ClusterTransport(localNode: self.node, settings: resolved)
+        #if SWIMDiscovery
+        self.swimAdapter = SWIMMembershipAdapter(localNode: self.node, settings: resolved.swim, transport: self.transport)
+        #endif
 
         self.receptionist.attach(system: self)
 
@@ -85,10 +97,31 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
             onFrame: { [weak self] frame, peer in
                 await self?.handleInboundFrame(frame, from: peer)
             },
+            onPeerConnected: { [weak self] peer in
+                await self?.syncReceptionist(to: peer)
+                #if SWIMDiscovery
+                await self?.swimAdapter.peerConnected(peer)
+                #endif
+            },
             onNodeDown: { [weak self] deadNode in
                 await self?.handleNodeDown(deadNode)
             }
         )
+
+        #if SWIMDiscovery
+        self.swimAdapter.start(
+            onMemberAlive: { [weak self] aliveNode in
+                await self?.syncReceptionist(to: aliveNode)
+            },
+            onMemberDown: { [weak self] deadNode in
+                await self?.handleNodeDown(deadNode)
+            }
+        )
+        #endif
+
+        if !resolved.seedNodes.isEmpty {
+            self.transport.connectToSeedNodes(resolved.seedNodes)
+        }
     }
 
     public func run() async throws {
@@ -104,6 +137,9 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         guard !alreadyShuttingDown else { return }
 
         await withTaskCancellationShield {
+            #if SWIMDiscovery
+            await swimAdapter.shutdown()
+            #endif
             await transport.shutdown()
             terminatedContinuation.finish()
         }
@@ -142,12 +178,20 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
     }
 
     public func resignID(_ id: ActorID) {
-        let (localWatchers, remoteWatcherNodes, hadActor) = state.withLock { s -> ([any LifecycleWatch], Set<Cluster.Node>, Bool) in
+        let (localWatchers, remoteWatcherNodes, unwatchRemotes, hadActor) = state.withLock {
+            s -> ([any LifecycleWatch], Set<Cluster.Node>, [ActorID], Bool) in
             let had = s.localActors.removeValue(forKey: id) != nil
 
+            var unwatches: [ActorID] = []
             if let watchedSubjects = s.subjectsByWatcher.removeValue(forKey: id) {
                 for subject in watchedSubjects {
                     s.watchersBySubject[subject]?.removeValue(forKey: id)
+                    if s.watchersBySubject[subject]?.isEmpty == true {
+                        s.watchersBySubject.removeValue(forKey: subject)
+                    }
+                    if subject.node != self.node {
+                        unwatches.append(subject)
+                    }
                 }
             }
 
@@ -161,17 +205,26 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
                         resolvedLocals.append(watcher)
                     }
                     s.subjectsByWatcher[watcherID]?.remove(id)
+                    if s.subjectsByWatcher[watcherID]?.isEmpty == true {
+                        s.subjectsByWatcher.removeValue(forKey: watcherID)
+                    }
                 } else {
                     remoteNodes.insert(watcherID.node)
                 }
             }
-            return (resolvedLocals, remoteNodes, had)
+            return (resolvedLocals, remoteNodes, unwatches, had)
         }
 
-        if hadActor || !localWatchers.isEmpty || !remoteWatcherNodes.isEmpty {
+        if hadActor || !localWatchers.isEmpty || !remoteWatcherNodes.isEmpty || !unwatchRemotes.isEmpty {
             Swift::Task {
                 await withTaskCancellationShield {
                     await self.receptionist.removeActor(id)
+                    for subject in unwatchRemotes {
+                        await self.transport.sendControlFrame(
+                            .unwatchActor(watcherID: id, subjectID: subject),
+                            to: subject.node
+                        )
+                    }
                     for watcher in localWatchers {
                         await self.deliverTermination(to: watcher, subjectID: id)
                     }
@@ -203,6 +256,29 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         ClusterInvocationEncoder()
     }
 
+    private func sendRemoteCallEnvelope(
+        type: WireHeader.FrameType,
+        targetID: ActorID,
+        target: Distributed::RemoteCallTarget,
+        invocation: inout InvocationEncoder
+    ) async throws -> Data {
+        let isShuttingDown = state.withLock { $0.isShuttingDown }
+        if isShuttingDown {
+            throw ClusterError.systemShuttingDown
+        }
+        let invocationData = try invocation.makePayload(targetIdentifier: target.identifier)
+        let envelope = RemoteCallEnvelope(targetID: targetID, invocationData: invocationData)
+        let envelopeData = try envelope.encodeBinary()
+        let correlationID = transport.nextCorrelationID()
+        let frame = WireFrame(type: type, correlationID: correlationID, sender: node, payload: envelopeData)
+        return try await transport.performRemoteCall(
+            frame: frame,
+            to: targetID.node,
+            target: targetID,
+            timeout: settings.requestTimeout
+        )
+    }
+
     public func remoteCall<Act, Err, Res>(
         on actor: Act,
         target: Distributed::RemoteCallTarget,
@@ -210,20 +286,11 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         throwing: Err.Type,
         returning: Res.Type
     ) async throws -> Res where Act: DistributedActor, Err: Error, Res: Codable, Act.ID == ActorID {
-        let isShuttingDown = state.withLock { $0.isShuttingDown }
-        if isShuttingDown {
-            throw ClusterError.systemShuttingDown
-        }
-        let invocationData = try invocation.makePayload(targetIdentifier: target.identifier)
-        let envelope = RemoteCallEnvelope(targetID: actor.id, invocationData: invocationData)
-        let envelopeData = try encodeCodableValue(envelope)
-        let correlationID = transport.nextCorrelationID()
-        let frame = WireFrame(type: .remoteCall, correlationID: correlationID, sender: node, payload: envelopeData)
-        let replyData = try await transport.performRemoteCall(
-            frame: frame,
-            to: actor.id.node,
-            target: actor.id,
-            timeout: settings.requestTimeout
+        let replyData = try await sendRemoteCallEnvelope(
+            type: .remoteCall,
+            targetID: actor.id,
+            target: target,
+            invocation: &invocation
         )
         if Res.self == Void.self, let voidValue = () as? Res {
             return voidValue
@@ -237,20 +304,11 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         invocation: inout InvocationEncoder,
         throwing: Err.Type
     ) async throws where Act: DistributedActor, Err: Error, Act.ID == ActorID {
-        let isShuttingDown = state.withLock { $0.isShuttingDown }
-        if isShuttingDown {
-            throw ClusterError.systemShuttingDown
-        }
-        let invocationData = try invocation.makePayload(targetIdentifier: target.identifier)
-        let envelope = RemoteCallEnvelope(targetID: actor.id, invocationData: invocationData)
-        let envelopeData = try encodeCodableValue(envelope)
-        let correlationID = transport.nextCorrelationID()
-        let frame = WireFrame(type: .remoteCallVoid, correlationID: correlationID, sender: node, payload: envelopeData)
-        _ = try await transport.performRemoteCall(
-            frame: frame,
-            to: actor.id.node,
-            target: actor.id,
-            timeout: settings.requestTimeout
+        _ = try await sendRemoteCallEnvelope(
+            type: .remoteCallVoid,
+            targetID: actor.id,
+            target: target,
+            invocation: &invocation
         )
     }
 
@@ -308,9 +366,18 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
     internal func unregisterWatch(watcherID: ActorID, subjectID: ActorID) {
         state.withLock { s in
             s.watchersBySubject[subjectID]?.removeValue(forKey: watcherID)
+            if s.watchersBySubject[subjectID]?.isEmpty == true {
+                s.watchersBySubject.removeValue(forKey: subjectID)
+            }
             s.subjectsByWatcher[watcherID]?.remove(subjectID)
+            if s.subjectsByWatcher[watcherID]?.isEmpty == true {
+                s.subjectsByWatcher.removeValue(forKey: watcherID)
+            }
             if subjectID.node != self.node {
                 s.remoteSubjectsByNode[subjectID.node]?.remove(subjectID)
+                if s.remoteSubjectsByNode[subjectID.node]?.isEmpty == true {
+                    s.remoteSubjectsByNode.removeValue(forKey: subjectID.node)
+                }
             }
         }
         if subjectID.node != node {
@@ -332,7 +399,21 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         }
     }
 
+    internal func syncReceptionist(to peer: Cluster.Node) async {
+        guard peer != node else { return }
+        for (keyID, actorID) in receptionist.allLocalRegistrations() {
+            await transport.sendControlFrame(
+                .receptionistSync(keyID: keyID, actorID: actorID, removed: false),
+                to: peer
+            )
+        }
+    }
+
     internal func handleNodeDown(_ deadNode: Cluster.Node) async {
+        #if SWIMDiscovery
+        swimAdapter.peerDisconnected(deadNode)
+        #endif
+        receptionist.removeRemoteActors(on: deadNode)
         let watchersToNotify = state.withLock { s -> [(ActorID, any LifecycleWatch)] in
             let subjects = s.remoteSubjectsByNode.removeValue(forKey: deadNode) ?? []
             var result: [(ActorID, any LifecycleWatch)] = []
@@ -343,6 +424,18 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
                         result.append((subject, watcher))
                     }
                     s.subjectsByWatcher[watcherID]?.remove(subject)
+                    if s.subjectsByWatcher[watcherID]?.isEmpty == true {
+                        s.subjectsByWatcher.removeValue(forKey: watcherID)
+                    }
+                }
+            }
+            for subject in Array(s.watchersBySubject.keys) {
+                guard var entries = s.watchersBySubject[subject] else { continue }
+                entries = entries.filter { $0.key.node != deadNode }
+                if entries.isEmpty {
+                    s.watchersBySubject.removeValue(forKey: subject)
+                } else {
+                    s.watchersBySubject[subject] = entries
                 }
             }
             return result
@@ -372,6 +465,9 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
             guard let envelope = try? decodeCodableValue(WatchEnvelope.self, from: frame.payload) else { return }
             state.withLock { s in
                 _ = s.watchersBySubject[envelope.subjectID]?.removeValue(forKey: envelope.watcherID)
+                if s.watchersBySubject[envelope.subjectID]?.isEmpty == true {
+                    s.watchersBySubject.removeValue(forKey: envelope.subjectID)
+                }
             }
         case .actorTerminated:
             guard let envelope = try? decodeCodableValue(TerminatedEnvelope.self, from: frame.payload) else { return }
@@ -379,6 +475,10 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         case .receptionistSync:
             guard let envelope = try? decodeCodableValue(ReceptionistSyncEnvelope.self, from: frame.payload) else { return }
             receptionist.applyRemoteSync(keyID: envelope.keyID, actorID: envelope.actorID, removed: envelope.removed)
+        case .swimGossip:
+            #if SWIMDiscovery
+            await swimAdapter.handleInboundGossip(frame.payload, from: peer)
+            #endif
         case .reply, .error, .heartbeat:
             break
         }
@@ -399,8 +499,14 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
                     result.append(watcher)
                 }
                 s.subjectsByWatcher[watcherID]?.remove(subjectID)
+                if s.subjectsByWatcher[watcherID]?.isEmpty == true {
+                    s.subjectsByWatcher.removeValue(forKey: watcherID)
+                }
             }
             s.remoteSubjectsByNode[subjectID.node]?.remove(subjectID)
+            if s.remoteSubjectsByNode[subjectID.node]?.isEmpty == true {
+                s.remoteSubjectsByNode.removeValue(forKey: subjectID.node)
+            }
             return result
         }
         for watcher in watchers {
@@ -411,7 +517,7 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
     internal func handleRemoteCallFrame(_ frame: WireFrame, from peer: Cluster.Node) async {
         let envelope: RemoteCallEnvelope
         do {
-            envelope = try decodeCodableValue(RemoteCallEnvelope.self, from: frame.payload)
+            envelope = try RemoteCallEnvelope.decodeBinary(from: frame.payload)
         } catch {
             await sendErrorFrame(correlationID: frame.correlationID, error: .decodingFailed("Unable to decode remote call envelope"), to: peer)
             return
@@ -452,7 +558,7 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
     }
 
     internal func sendErrorFrame(correlationID: UInt64, error: ClusterError, to peer: Cluster.Node) async {
-        let envelope = ErrorEnvelope(clusterError: error, message: "\(error)")
+        let envelope = ErrorEnvelope(clusterError: error, errorTypeName: nil, errorData: nil, message: "\(error)")
         guard let payload = try? encodeCodableValue(envelope) else { return }
         let frame = WireFrame(type: .error, correlationID: correlationID, sender: node, payload: payload)
         do {

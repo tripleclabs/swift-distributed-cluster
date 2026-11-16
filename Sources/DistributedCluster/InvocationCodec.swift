@@ -1,5 +1,6 @@
 import Distributed
 import Foundation
+import NIOCore
 
 public struct InvocationPayload: Codable, Sendable {
     public var targetIdentifier: String
@@ -21,16 +22,113 @@ public struct InvocationPayload: Codable, Sendable {
         self.returnType = returnType
         self.errorType = errorType
     }
+
+    internal func encodeBinary() throws(ClusterError) -> Data {
+        var buffer = ByteBufferAllocator().buffer(capacity: 128)
+        try BinaryCodec.writeString(targetIdentifier, to: &buffer)
+        try BinaryCodec.writeString(returnType, to: &buffer)
+        try BinaryCodec.writeString(errorType, to: &buffer)
+
+        guard genericSubstitutions.count <= Int(UInt16.max) else {
+            throw .encodingFailed("Too many generic substitutions")
+        }
+        buffer.writeInteger(UInt16(genericSubstitutions.count))
+        for sub in genericSubstitutions {
+            try BinaryCodec.writeString(sub, to: &buffer)
+        }
+
+        guard arguments.count <= Int(UInt16.max) else {
+            throw .encodingFailed("Too many invocation arguments")
+        }
+        buffer.writeInteger(UInt16(arguments.count))
+        for arg in arguments {
+            try BinaryCodec.writeData(arg, to: &buffer)
+        }
+        return Data(buffer.readableBytesView)
+    }
+
+    internal static func decodeBinary(from data: Data) throws(ClusterError) -> InvocationPayload {
+        var buffer = ByteBufferAllocator().buffer(capacity: data.count)
+        buffer.writeBytes(data)
+
+        let targetIdentifier = try BinaryCodec.readString(from: &buffer)
+        let returnType = try BinaryCodec.readString(from: &buffer)
+        let errorType = try BinaryCodec.readString(from: &buffer)
+
+        guard let subCount: UInt16 = buffer.readInteger() else {
+            throw .decodingFailed("Truncated generic substitution count")
+        }
+        var genericSubstitutions: [String] = []
+        genericSubstitutions.reserveCapacity(Int(subCount))
+        for _ in 0..<subCount {
+            genericSubstitutions.append(try BinaryCodec.readString(from: &buffer))
+        }
+
+        guard let argCount: UInt16 = buffer.readInteger() else {
+            throw .decodingFailed("Truncated argument count")
+        }
+        var arguments: [Data] = []
+        arguments.reserveCapacity(Int(argCount))
+        for _ in 0..<argCount {
+            arguments.append(try BinaryCodec.readData(from: &buffer))
+        }
+
+        return InvocationPayload(
+            targetIdentifier: targetIdentifier,
+            genericSubstitutions: genericSubstitutions,
+            arguments: arguments,
+            returnType: returnType,
+            errorType: errorType
+        )
+    }
 }
 
-internal struct RemoteCallEnvelope: Codable, Sendable {
+internal struct RemoteCallEnvelope: Sendable {
     var targetID: ClusterActorID
     var invocationData: Data
+
+    func encodeBinary() throws(ClusterError) -> Data {
+        var buffer = ByteBufferAllocator().buffer(capacity: 64 + invocationData.count)
+        try BinaryCodec.writeActorID(targetID, to: &buffer)
+        buffer.writeBytes(invocationData)
+        return Data(buffer.readableBytesView)
+    }
+
+    static func decodeBinary(from data: Data) throws(ClusterError) -> RemoteCallEnvelope {
+        var buffer = ByteBufferAllocator().buffer(capacity: data.count)
+        buffer.writeBytes(data)
+        let targetID = try BinaryCodec.readActorID(from: &buffer)
+        let remaining = buffer.readableBytes
+        let invocationData = remaining > 0 ? Data(buffer.readBytes(length: remaining) ?? []) : Data()
+        return RemoteCallEnvelope(targetID: targetID, invocationData: invocationData)
+    }
 }
 
 internal struct ErrorEnvelope: Codable, Sendable {
     var clusterError: ClusterError?
+    var errorTypeName: String?
+    var errorData: Data?
     var message: String
+}
+
+internal func decodeThrownError(from data: Data) -> any Error {
+    guard let envelope = try? decodeCodableValue(ErrorEnvelope.self, from: data) else {
+        return ClusterError.decodingFailed("Remote error frame could not be decoded")
+    }
+    if let clusterError = envelope.clusterError {
+        return clusterError
+    }
+    if let typeName = envelope.errorTypeName,
+       let errorData = envelope.errorData,
+       let resolvedType = _typeByName(typeName) as? any (Error & Decodable).Type {
+        func open<E: Error & Decodable>(_ type: E.Type) throws -> E {
+            try JSONDecoder().decode(E.self, from: errorData)
+        }
+        if let decoded = try? open(resolvedType) {
+            return decoded
+        }
+    }
+    return ClusterError.decodingFailed("Remote error: \(envelope.message)")
 }
 
 internal func encodeCodableValue<T: Codable>(_ value: T) throws(ClusterError) -> Data {
@@ -77,7 +175,7 @@ public struct ClusterInvocationEncoder: Distributed::DistributedTargetInvocation
     public init() {}
 
     public mutating func recordGenericSubstitution<T>(_ type: T.Type) throws {
-        genericSubstitutions.append(String(reflecting: type))
+        genericSubstitutions.append(_mangledTypeName(type) ?? "")
     }
 
     public mutating func recordArgument<Value>(_ argument: Distributed::RemoteCallArgument<Value>) throws where Value: Codable {
@@ -85,11 +183,11 @@ public struct ClusterInvocationEncoder: Distributed::DistributedTargetInvocation
     }
 
     public mutating func recordReturnType<R>(_ type: R.Type) throws where R: Codable {
-        returnTypeName = String(reflecting: type)
+        returnTypeName = _mangledTypeName(type) ?? ""
     }
 
     public mutating func recordErrorType<E>(_ type: E.Type) throws where E: Error {
-        errorTypeName = String(reflecting: type)
+        errorTypeName = _mangledTypeName(type) ?? ""
     }
 
     public mutating func doneRecording() throws {}
@@ -102,7 +200,7 @@ public struct ClusterInvocationEncoder: Distributed::DistributedTargetInvocation
             returnType: returnTypeName,
             errorType: errorTypeName
         )
-        return try encodeCodableValue(payload)
+        return try payload.encodeBinary()
     }
 }
 
@@ -117,11 +215,19 @@ public struct ClusterInvocationDecoder: Distributed::DistributedTargetInvocation
     }
 
     public init(data: Data) throws(ClusterError) {
-        self.payload = try decodeCodableValue(InvocationPayload.self, from: data)
+        self.payload = try InvocationPayload.decodeBinary(from: data)
     }
 
     public mutating func decodeGenericSubstitutions() throws -> [any Any.Type] {
-        []
+        var resolved: [any Any.Type] = []
+        resolved.reserveCapacity(payload.genericSubstitutions.count)
+        for name in payload.genericSubstitutions {
+            guard !name.isEmpty, let type = _typeByName(name) else {
+                throw ClusterError.decodingFailed("Unable to resolve generic substitution type '\(name)'")
+            }
+            resolved.append(type)
+        }
+        return resolved
     }
 
     public mutating func decodeNextArgument<Argument>() throws -> Argument where Argument: Codable {
@@ -134,11 +240,13 @@ public struct ClusterInvocationDecoder: Distributed::DistributedTargetInvocation
     }
 
     public mutating func decodeErrorType() throws -> (any Any.Type)? {
-        nil
+        guard !payload.errorType.isEmpty else { return nil }
+        return _typeByName(payload.errorType)
     }
 
     public mutating func decodeReturnType() throws -> (any Any.Type)? {
-        nil
+        guard !payload.returnType.isEmpty else { return nil }
+        return _typeByName(payload.returnType)
     }
 }
 
@@ -161,7 +269,7 @@ public struct ClusterResultHandler: Distributed::DistributedTargetInvocationResu
             let data = try encodeCodableValue(value)
             await replySink(.reply, correlationID, data)
         } catch {
-            let envelope = ErrorEnvelope(clusterError: error, message: "\(error)")
+            let envelope = ErrorEnvelope(clusterError: error, errorTypeName: nil, errorData: nil, message: "\(error)")
             let data = (try? encodeCodableValue(envelope)) ?? Data()
             await replySink(.error, correlationID, data)
         }
@@ -174,9 +282,18 @@ public struct ClusterResultHandler: Distributed::DistributedTargetInvocationResu
     public func onThrow<Err>(error: Err) async throws where Err: Error {
         let envelope: ErrorEnvelope
         if let clusterError = error as? ClusterError {
-            envelope = ErrorEnvelope(clusterError: clusterError, message: "\(clusterError)")
+            envelope = ErrorEnvelope(clusterError: clusterError, errorTypeName: nil, errorData: nil, message: "\(clusterError)")
+        } else if let codableError = error as? any (Error & Codable),
+                  let typeName = _mangledTypeName(type(of: codableError)),
+                  let encoded = try? encodeAnyCodable(codableError) {
+            envelope = ErrorEnvelope(
+                clusterError: nil,
+                errorTypeName: typeName,
+                errorData: encoded,
+                message: String(describing: error)
+            )
         } else {
-            envelope = ErrorEnvelope(clusterError: nil, message: String(describing: error))
+            envelope = ErrorEnvelope(clusterError: nil, errorTypeName: nil, errorData: nil, message: String(describing: error))
         }
         let data = (try? encodeCodableValue(envelope)) ?? Data()
         await replySink(.error, correlationID, data)
