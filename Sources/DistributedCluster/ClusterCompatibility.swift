@@ -1,4 +1,4 @@
-import Distributed
+@_exported import Distributed
 import Foundation
 
 public typealias ClusterSystemSettings = ClusterSystem.Settings
