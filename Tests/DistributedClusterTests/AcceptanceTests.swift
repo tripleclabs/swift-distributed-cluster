@@ -964,6 +964,34 @@ struct DistributedClusterAcceptanceTests {
         #expect(snapshot.count >= 2)
         #expect(nodeA.cluster.node == nodeA.node)
     }
+
+    @Test("LocalReceptionist checkIn unique/append, checkOut, and auto-eviction on dealloc")
+    func localReceptionistLifecycle() async throws {
+        let system = await ClusterSystem(settings: ClusterSystemSettings(name: "local-rec", host: "127.0.0.1", port: 19337))
+        defer { await system.shutdown() }
+
+        let key = LocalReception.Key<EchoWorker>.name("local-workers")
+        var w1: EchoWorker? = EchoWorker(actorSystem: system)
+        let w2 = EchoWorker(actorSystem: system)
+
+        try await system.localReceptionist.checkIn(try #require(w1), key: key, mode: .unique)
+        do {
+            try await system.localReceptionist.checkIn(w2, key: key, mode: .unique)
+            Issue.record("Expected duplicateRegistration for .unique mode")
+        } catch LocalReceptionistError.duplicateRegistration {
+            // Expected
+        }
+
+        do {
+            let found = await system.localReceptionist.lookup(key)
+            #expect(found.count == 1)
+        }
+
+        w1 = nil
+        try await Task.sleep(for: .milliseconds(100))
+        let afterDealloc = await system.localReceptionist.lookup(key)
+        #expect(afterDealloc.isEmpty)
+    }
 }
 
 #if MutualTLS

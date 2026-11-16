@@ -68,6 +68,18 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
     public let node: Cluster.Node
     public let settings: Settings
     public let receptionist: ClusterReceptionist
+    private let localReceptionistStorage = Mutex<LocalReceptionist?>(nil)
+
+    public var localReceptionist: LocalReceptionist {
+        localReceptionistStorage.withLock { existing in
+            if let existing {
+                return existing
+            }
+            let created = LocalReceptionist(system: self)
+            existing = created
+            return created
+        }
+    }
 
     public var cluster: ClusterControl {
         ClusterControl(system: self)
@@ -281,6 +293,9 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
             Swift::Task {
                 await withTaskCancellationShield {
                     await self.receptionist.removeActor(id)
+                    if let localReg = self.localReceptionistStorage.withLock({ $0 }) {
+                        await localReg.terminated(actor: id)
+                    }
                     for subject in unwatchRemotes {
                         await self.transport.sendControlFrame(
                             .unwatchActor(watcherID: id, subjectID: subject),
