@@ -18,10 +18,15 @@ let package = Package(
             name: "SWIMDiscovery",
             description: "Enables peer-to-peer SWIM gossip membership via swift-cluster-membership."
         ),
+        .trait(
+            name: "MutualTLS",
+            description: "Enables TLS and mutual TLS (mTLS) transport encryption via swift-nio-ssl."
+        ),
         .default(enabledTraits: [])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.77.0"),
+        .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.27.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
         .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", from: "2.6.0"),
         .package(url: "https://github.com/apple/swift-cluster-membership.git", from: "0.4.0")
@@ -32,6 +37,7 @@ let package = Package(
             dependencies: [
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl", condition: .when(traits: ["MutualTLS"])),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
                 .product(
@@ -47,7 +53,10 @@ let package = Package(
         ),
         .testTarget(
             name: "DistributedClusterTests",
-            dependencies: ["DistributedCluster"],
+            dependencies: [
+                "DistributedCluster",
+                .product(name: "NIOSSL", package: "swift-nio-ssl", condition: .when(traits: ["MutualTLS"]))
+            ],
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]

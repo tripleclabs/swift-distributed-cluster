@@ -2,6 +2,9 @@ import Foundation
 import Logging
 import NIOCore
 import NIOPosix
+#if MutualTLS
+import NIOSSL
+#endif
 import Synchronization
 
 internal enum ControlFrame: Sendable {
@@ -64,6 +67,9 @@ internal final class ClusterTransport: Sendable {
     let group: MultiThreadedEventLoopGroup
     let state = Mutex(State())
     let correlationCounter = Atomic<UInt64>(1)
+    #if MutualTLS
+    private let sslContexts = Mutex<(server: NIOSSLContext?, client: NIOSSLContext?)>((nil, nil))
+    #endif
 
     init(localNode: Cluster.Node, settings: ClusterSystem.Settings) {
         self.localNode = localNode
@@ -71,6 +77,41 @@ internal final class ClusterTransport: Sendable {
         self.logger = settings.logger
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: max(1, min(System.coreCount, 4)))
     }
+
+    private func wrapPeerChannel(
+        _ channel: any Channel,
+        isServer: Bool,
+        remoteHost: String?
+    ) -> EventLoopFuture<PeerChannel> {
+        channel.eventLoop.makeCompletedFuture {
+            #if MutualTLS
+            let contexts = self.sslContexts.withLock { $0 }
+            if isServer, let serverContext = contexts.server {
+                try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: serverContext))
+            } else if !isServer, let clientContext = contexts.client {
+                let sniHost = self.settings.tls?.serverHostname ?? Self.nonIPLiteralHost(remoteHost)
+                try channel.pipeline.syncOperations.addHandler(
+                    NIOSSLClientHandler(context: clientContext, serverHostname: sniHost)
+                )
+            }
+            #endif
+            try channel.pipeline.syncOperations.addHandler(ByteToMessageHandler(WireFrameDecoder()))
+            try channel.pipeline.syncOperations.addHandler(MessageToByteHandler(WireFrameEncoder()))
+            return try NIOAsyncChannel<WireFrame, WireFrame>(wrappingChannelSynchronously: channel)
+        }
+    }
+
+    #if MutualTLS
+    private static func nonIPLiteralHost(_ host: String?) -> String? {
+        guard let host, !host.isEmpty else { return nil }
+        var ipv4 = in_addr()
+        var ipv6 = in6_addr()
+        if inet_pton(AF_INET, host, &ipv4) == 1 || inet_pton(AF_INET6, host, &ipv6) == 1 {
+            return nil
+        }
+        return host
+    }
+    #endif
 
     func nextCorrelationID() -> UInt64 {
         correlationCounter.wrappingAdd(1, ordering: .sequentiallyConsistent).newValue
@@ -81,6 +122,21 @@ internal final class ClusterTransport: Sendable {
         onPeerConnected: @escaping @Sendable (Cluster.Node) async -> Void,
         onNodeDown: @escaping @Sendable (Cluster.Node) async -> Void
     ) async throws(ClusterError) {
+        #if MutualTLS
+        if let tls = settings.tls {
+            do {
+                let serverCtx = try NIOSSLContext(configuration: tls.server)
+                let clientCtx = try NIOSSLContext(configuration: tls.client)
+                sslContexts.withLock { $0 = (serverCtx, clientCtx) }
+            } catch {
+                throw .bindFailed(
+                    host: localNode.endpoint.host,
+                    port: localNode.endpoint.port,
+                    reason: "TLS initialization failed: \(error)"
+                )
+            }
+        }
+        #endif
         state.withLock { s in
             s.onFrame = onFrame
             s.onPeerConnected = onPeerConnected
@@ -91,11 +147,7 @@ internal final class ClusterTransport: Sendable {
             serverChannel = try await ServerBootstrap(group: group)
                 .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
                 .bind(host: localNode.endpoint.host, port: localNode.endpoint.port) { channel in
-                    channel.eventLoop.makeCompletedFuture {
-                        try channel.pipeline.syncOperations.addHandler(ByteToMessageHandler(WireFrameDecoder()))
-                        try channel.pipeline.syncOperations.addHandler(MessageToByteHandler(WireFrameEncoder()))
-                        return try NIOAsyncChannel<WireFrame, WireFrame>(wrappingChannelSynchronously: channel)
-                    }
+                    self.wrapPeerChannel(channel, isServer: true, remoteHost: nil)
                 }
         } catch {
             throw .bindFailed(host: localNode.endpoint.host, port: localNode.endpoint.port, reason: "\(error)")
@@ -132,11 +184,7 @@ internal final class ClusterTransport: Sendable {
                 do {
                     let channel = try await ClientBootstrap(group: self.group)
                         .connect(host: endpoint.host, port: endpoint.port) { channel in
-                            channel.eventLoop.makeCompletedFuture {
-                                try channel.pipeline.syncOperations.addHandler(ByteToMessageHandler(WireFrameDecoder()))
-                                try channel.pipeline.syncOperations.addHandler(MessageToByteHandler(WireFrameEncoder()))
-                                return try NIOAsyncChannel<WireFrame, WireFrame>(wrappingChannelSynchronously: channel)
-                            }
+                            self.wrapPeerChannel(channel, isServer: false, remoteHost: endpoint.host)
                         }
                     await self.supervisePeerChannel(
                         channel,
@@ -394,11 +442,7 @@ internal final class ClusterTransport: Sendable {
         do {
             let channel = try await ClientBootstrap(group: group)
                 .connect(host: node.endpoint.host, port: node.endpoint.port) { channel in
-                    channel.eventLoop.makeCompletedFuture {
-                        try channel.pipeline.syncOperations.addHandler(ByteToMessageHandler(WireFrameDecoder()))
-                        try channel.pipeline.syncOperations.addHandler(MessageToByteHandler(WireFrameEncoder()))
-                        return try NIOAsyncChannel<WireFrame, WireFrame>(wrappingChannelSynchronously: channel)
-                    }
+                    self.wrapPeerChannel(channel, isServer: false, remoteHost: node.endpoint.host)
                 }
             let taskID = UUID()
             let task = Swift::Task {

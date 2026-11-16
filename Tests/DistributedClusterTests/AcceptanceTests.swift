@@ -1,6 +1,9 @@
 import Distributed
 @testable import DistributedCluster
 import Foundation
+#if MutualTLS
+import NIOSSL
+#endif
 import Testing
 
 struct WorkerProblem: Error, Codable, Equatable, Sendable {
@@ -860,7 +863,97 @@ struct DistributedClusterAcceptanceTests {
         #expect(evicted)
     }
     #endif
+
+    #if MutualTLS
+    @Test("MutualTLS encrypts inter-node RPCs and rejects untrusted peers")
+    func mutualTLSRoundTripAndRejection() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dc-mtls-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let certPath = tempDir.appendingPathComponent("node.crt").path
+        let keyPath = tempDir.appendingPathComponent("node.key").path
+        let rogueCertPath = tempDir.appendingPathComponent("rogue.crt").path
+        let rogueKeyPath = tempDir.appendingPathComponent("rogue.key").path
+
+        try generateSelfSignedCert(certPath: certPath, keyPath: keyPath, san: "IP:127.0.0.1")
+        try generateSelfSignedCert(certPath: rogueCertPath, keyPath: rogueKeyPath, san: "IP:127.0.0.1")
+
+        let trustedCerts = try NIOSSLCertificate.fromPEMFile(certPath)
+        let trustedCert = try #require(trustedCerts.first)
+        let trustedKey = try NIOSSLPrivateKey(file: keyPath, format: .pem)
+        let rogueCerts = try NIOSSLCertificate.fromPEMFile(rogueCertPath)
+        let rogueCert = try #require(rogueCerts.first)
+        let rogueKey = try NIOSSLPrivateKey(file: rogueKeyPath, format: .pem)
+
+        let trustedTLS = ClusterTLSConfiguration.mutualTLS(
+            certificateChain: [.certificate(trustedCert)],
+            privateKey: .privateKey(trustedKey),
+            trustRoots: .certificates([trustedCert])
+        )
+
+        let nodeA = try await ClusterSystem("mtls-a") {
+            $0.bindPort = 19332
+            $0.tls = trustedTLS
+        }
+        let nodeB = try await ClusterSystem("mtls-b") {
+            $0.bindPort = 19333
+            $0.tls = trustedTLS
+        }
+        defer {
+            await nodeA.shutdown()
+            await nodeB.shutdown()
+        }
+
+        let worker = EchoWorker(actorSystem: nodeB)
+        let proxy = try EchoWorker.resolve(id: worker.id, using: nodeA)
+        #expect(try await proxy.ping("encrypted") == "pong:encrypted")
+
+        // A rogue node with an untrusted certificate must fail to connect.
+        let rogueNode = try await ClusterSystem("mtls-rogue") {
+            $0.bindPort = 19334
+            $0.requestTimeout = .seconds(1)
+            $0.tls = ClusterTLSConfiguration.mutualTLS(
+                certificateChain: [.certificate(rogueCert)],
+                privateKey: .privateKey(rogueKey),
+                trustRoots: .certificates([trustedCert])
+            )
+        }
+        defer { await rogueNode.shutdown() }
+
+        let rogueProxy = try EchoWorker.resolve(id: worker.id, using: rogueNode)
+        do {
+            _ = try await rogueProxy.ping("should-fail")
+            Issue.record("Expected mTLS handshake failure for untrusted client certificate")
+        } catch {
+            // Expected: handshake failure closes channel and fails call.
+        }
+    }
+    #endif
 }
+
+#if MutualTLS
+private func generateSelfSignedCert(certPath: String, keyPath: String, san: String) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")
+    process.arguments = [
+        "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", keyPath,
+        "-out", certPath,
+        "-days", "1",
+        "-subj", "/CN=127.0.0.1",
+        "-addext", "subjectAltName=\(san)"
+    ]
+    process.standardOutput = Pipe()
+    process.standardError = Pipe()
+    try process.run()
+    process.waitUntilExit()
+    if process.terminationStatus != 0 {
+        throw ClusterError.bindFailed(host: "127.0.0.1", port: 0, reason: "openssl exited with \(process.terminationStatus)")
+    }
+}
+#endif
 
 func expectNoTermination(_ supervisor: TestSupervisor, within duration: Duration) async throws -> Bool {
     try await Task.sleep(for: duration)

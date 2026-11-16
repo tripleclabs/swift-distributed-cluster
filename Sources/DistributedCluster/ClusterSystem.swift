@@ -25,6 +25,9 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         #if SWIMDiscovery
         public var swim: SWIM.Settings = SWIM.Settings()
         #endif
+        #if MutualTLS
+        public var tls: ClusterTLSConfiguration? = nil
+        #endif
 
         public init(nodeName: String) {
             self.logger = Logger(label: "cluster.\(nodeName)")
