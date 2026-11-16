@@ -17,11 +17,15 @@ extension Cluster {
         case lowestReachable(minNumberOfMembers: Int)
     }
 
-    public enum MemberStatus: Sendable, Hashable {
-        case joining
-        case up
-        case down
-        case removed
+    public enum MemberStatus: Int, Sendable, Hashable, Comparable {
+        case joining = 0
+        case up = 1
+        case down = 2
+        case removed = 3
+
+        public static func < (lhs: MemberStatus, rhs: MemberStatus) -> Bool {
+            lhs.rawValue < rhs.rawValue
+        }
     }
 
     public struct Member: Sendable, Hashable {
@@ -39,6 +43,10 @@ extension Cluster {
 
         public var count: Int { members.count }
         public var isEmpty: Bool { members.isEmpty }
+
+        public func members(atLeast status: MemberStatus) -> [Member] {
+            members.filter { $0.status >= status }
+        }
 
         public init(members: [Member]) {
             self.members = members
