@@ -1,9 +1,22 @@
 @_exported import Distributed
 import Foundation
+import Logging
 
 public typealias ClusterSystemSettings = ClusterSystem.Settings
 
+extension ClusterSystem.Settings {
+    public var logging: Logger {
+        get { logger }
+        set { logger = newValue }
+    }
+}
+
 extension Cluster {
+    public enum AutoLeaderElectionSettings: Sendable, Hashable {
+        case none
+        case lowestReachable(minNumberOfMembers: Int)
+    }
+
     public enum MemberStatus: Sendable, Hashable {
         case joining
         case up

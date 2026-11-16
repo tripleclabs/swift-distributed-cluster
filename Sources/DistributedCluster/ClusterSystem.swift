@@ -23,6 +23,7 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         public var heartbeatInterval: Duration = .seconds(2)
         public var heartbeatTimeout: Duration = .seconds(6)
         public var logger: Logger
+        public var autoLeaderElection: Cluster.AutoLeaderElectionSettings = .none
         #if SWIMDiscovery
         public var swim: SWIM.Settings = SWIM.Settings()
         #endif
