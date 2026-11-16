@@ -931,6 +931,39 @@ struct DistributedClusterAcceptanceTests {
         }
     }
     #endif
+
+    @Test("Compatibility shims: ClusterSystemSettings, cluster.join, membershipSnapshot, events, DistributedReception.checkIn")
+    func compatibilityShims() async throws {
+        let settingsA = ClusterSystemSettings(name: "compat-a", host: "127.0.0.1", port: 19335)
+        let settingsB = ClusterSystemSettings(name: "compat-b", host: "127.0.0.1", port: 19336)
+        let nodeA = await ClusterSystem(settings: settingsA)
+        let nodeB = await ClusterSystem(settings: settingsB)
+        defer {
+            await nodeA.shutdown()
+            await nodeB.shutdown()
+        }
+
+        let key = DistributedReception.Key(EchoWorker.self, id: "compat-workers")
+        let worker = EchoWorker(actorSystem: nodeB)
+        await nodeB.receptionist.checkIn(worker, with: key)
+
+        let events = nodeA.cluster.events
+        let eventTask = Task { () -> Bool in
+            for await event in events {
+                if case .membershipChange(let change) = event, change.status == .up {
+                    return true
+                }
+            }
+            return false
+        }
+
+        nodeA.cluster.join(host: "127.0.0.1", port: 19336)
+        #expect(await eventTask.value)
+
+        let snapshot = await nodeA.cluster.membershipSnapshot
+        #expect(snapshot.count >= 2)
+        #expect(nodeA.cluster.node == nodeA.node)
+    }
 }
 
 #if MutualTLS

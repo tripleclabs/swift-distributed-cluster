@@ -15,6 +15,7 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
     public typealias SerializationRequirement = Codable
 
     public struct Settings: Sendable {
+        public var nodeName: String
         public var bindHost: String = "127.0.0.1"
         public var bindPort: Int = 2552
         public var seedNodes: [Cluster.Endpoint] = []
@@ -30,7 +31,15 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         #endif
 
         public init(nodeName: String) {
+            self.nodeName = nodeName
             self.logger = Logger(label: "cluster.\(nodeName)")
+        }
+
+        public init(name: String, host: String = "127.0.0.1", port: Int = 2552) {
+            self.nodeName = name
+            self.bindHost = host
+            self.bindPort = port
+            self.logger = Logger(label: "cluster.\(name)")
         }
     }
 
@@ -52,12 +61,17 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         var remoteSubjectsByNode: [Cluster.Node: Set<ActorID>] = [:]
         var nextIncarnation: UInt64 = 1
         var isShuttingDown: Bool = false
+        var clusterEventContinuations: [UUID: AsyncStream<Cluster.Event>.Continuation] = [:]
     }
 
     public let name: String
     public let node: Cluster.Node
     public let settings: Settings
     public let receptionist: ClusterReceptionist
+
+    public var cluster: ClusterControl {
+        ClusterControl(system: self)
+    }
 
     internal let state = Mutex(State())
     internal let transport: ClusterTransport
@@ -101,10 +115,16 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
                 await self?.handleInboundFrame(frame, from: peer)
             },
             onPeerConnected: { [weak self] peer in
-                await self?.syncReceptionist(to: peer)
+                guard let self else { return }
+                await self.syncReceptionist(to: peer)
                 #if SWIMDiscovery
-                await self?.swimAdapter.peerConnected(peer)
+                await self.swimAdapter.peerConnected(peer)
                 #endif
+                self.emitClusterEvent(.membershipChange(Cluster.MembershipChange(
+                    node: peer,
+                    previousStatus: nil,
+                    status: .up
+                )))
             },
             onNodeDown: { [weak self] deadNode in
                 await self?.handleNodeDown(deadNode)
@@ -127,15 +147,51 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         }
     }
 
+    public convenience init(settings: ClusterSystemSettings) async {
+        do {
+            try await self.init(settings.nodeName) { $0 = settings }
+        } catch {
+            fatalError("ClusterSystem(settings:) failed to start: \(error)")
+        }
+    }
+
+    internal func makeClusterEventStream() -> AsyncStream<Cluster.Event> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<Cluster.Event>.makeStream()
+        let isShuttingDown = state.withLock { s -> Bool in
+            if s.isShuttingDown { return true }
+            s.clusterEventContinuations[id] = continuation
+            return false
+        }
+        if isShuttingDown {
+            continuation.finish()
+            return stream
+        }
+        continuation.onTermination = { [weak self] _ in
+            guard let self else { return }
+            _ = self.state.withLock { $0.clusterEventContinuations.removeValue(forKey: id) }
+        }
+        return stream
+    }
+
+    internal func emitClusterEvent(_ event: Cluster.Event) {
+        let continuations = state.withLock { Array($0.clusterEventContinuations.values) }
+        for continuation in continuations {
+            continuation.yield(event)
+        }
+    }
+
     public func run() async throws {
         for await _ in terminated {}
     }
 
     public func shutdown() async {
-        let alreadyShuttingDown = state.withLock { s -> Bool in
-            if s.isShuttingDown { return true }
+        let (alreadyShuttingDown, eventContinuations) = state.withLock { s -> (Bool, [AsyncStream<Cluster.Event>.Continuation]) in
+            if s.isShuttingDown { return (true, []) }
             s.isShuttingDown = true
-            return false
+            let conts = Array(s.clusterEventContinuations.values)
+            s.clusterEventContinuations.removeAll()
+            return (false, conts)
         }
         guard !alreadyShuttingDown else { return }
 
@@ -144,6 +200,9 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
             await swimAdapter.shutdown()
             #endif
             await transport.shutdown()
+            for continuation in eventContinuations {
+                continuation.finish()
+            }
             terminatedContinuation.finish()
         }
     }
@@ -446,6 +505,11 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         for (subject, watcher) in watchersToNotify {
             await self.deliverTermination(to: watcher, subjectID: subject)
         }
+        emitClusterEvent(.membershipChange(Cluster.MembershipChange(
+            node: deadNode,
+            previousStatus: .up,
+            status: .down
+        )))
     }
 
     internal func handleInboundFrame(_ frame: WireFrame, from peer: Cluster.Node) async {
