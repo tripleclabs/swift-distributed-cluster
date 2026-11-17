@@ -146,6 +146,23 @@ public struct ClusterControl: Sendable {
         system.transport.connectToSeedNodes([endpoint])
     }
 
+    public func join(node: Cluster.Node) {
+        system.transport.connectToSeedNodes([node.endpoint])
+    }
+
+    @discardableResult
+    public func joined(node: Cluster.Node, within timeout: Duration) async throws -> Cluster.Member {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            let snapshot = await membershipSnapshot
+            if let member = snapshot.member(node) {
+                return member
+            }
+            try await Swift::Task.sleep(for: .milliseconds(25))
+        }
+        throw ClusterError.nodeUnreachable(node)
+    }
+
     public var membershipSnapshot: Cluster.MembershipSnapshot {
         get async {
             var seen = Set<Cluster.Node>([system.node])
