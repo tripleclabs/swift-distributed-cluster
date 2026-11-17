@@ -383,7 +383,7 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
             frame: frame,
             to: targetID.node,
             target: targetID,
-            timeout: settings.requestTimeout
+            timeout: RemoteCall.currentTimeout ?? settings.requestTimeout
         )
     }
 

@@ -214,3 +214,16 @@ extension ClusterReceptionist {
         await register(actor, with: key)
     }
 }
+
+public enum RemoteCall {
+    @TaskLocal internal static var currentTimeout: Duration?
+
+    public static func with<Result>(
+        timeout: Duration,
+        remoteCall: () async throws -> Result
+    ) async throws -> Result {
+        try await $currentTimeout.withValue(timeout) {
+            try await remoteCall()
+        }
+    }
+}
