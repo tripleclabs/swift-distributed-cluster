@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    container:
+      image: swift:6.4
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: default
+            flags: ""
+          - label: SWIMDiscovery
+            flags: "--traits SWIMDiscovery"
+          - label: MutualTLS
+            flags: "--traits MutualTLS"
+          - label: SWIMDiscovery + MutualTLS
+            flags: "--traits SWIMDiscovery,MutualTLS"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure openssl is available for mTLS tests
+        if: contains(matrix.flags, 'MutualTLS')
+        run: |
+          if ! command -v openssl >/dev/null 2>&1; then
+            apt-get update && apt-get install -y --no-install-recommends openssl
+          fi
+
+      - name: Run tests
+        run: swift test ${{ matrix.flags }}
