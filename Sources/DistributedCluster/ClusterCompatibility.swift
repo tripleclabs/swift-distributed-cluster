@@ -63,6 +63,12 @@ public struct ClusterSingletonControl: Sendable {
     }
 }
 
+extension Cluster.Endpoint {
+    public init(systemName: String, host: String, port: Int) {
+        self.init(host: host, port: port)
+    }
+}
+
 extension Cluster {
     public enum AutoLeaderElectionSettings: Sendable, Hashable {
         case none
@@ -99,6 +105,10 @@ extension Cluster {
 
         public func members(atLeast status: MemberStatus) -> [Member] {
             members.filter { $0.status >= status }
+        }
+
+        public func members(atMost status: MemberStatus) -> [Member] {
+            members.filter { $0.status <= status }
         }
 
         public func member(_ node: Cluster.Node) -> Member? {
