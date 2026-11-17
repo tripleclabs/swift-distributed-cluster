@@ -7,11 +7,15 @@ public enum LocalReception {
     ///
     /// Keys are string-identified at runtime and type-checked at compile time.
     /// This prevents accidental cross-type lookups under the same raw key ID.
-    public struct Key<Act: DistributedActor>: Sendable, Hashable where Act.ActorSystem == ClusterSystem {
+    public struct Key<Act: DistributedActor>: Sendable, Hashable, CustomStringConvertible where Act.ActorSystem == ClusterSystem {
         public let id: String
 
         public init(_ id: String) {
             self.id = id
+        }
+
+        public var description: String {
+            storageID
         }
 
         /// Internal key used for storage to prevent cross-type collisions for the same raw id.

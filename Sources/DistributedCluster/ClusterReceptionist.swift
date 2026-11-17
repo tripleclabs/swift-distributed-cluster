@@ -3,12 +3,16 @@ import Foundation
 import Synchronization
 
 public enum Reception {
-    public struct Key<Act: DistributedActor>: Hashable, Sendable
+    public struct Key<Act: DistributedActor>: Hashable, Sendable, CustomStringConvertible
     where Act.ID == ClusterActorID {
         public let id: String
 
         public init(_ id: String, as actorType: Act.Type = Act.self) {
             self.id = id
+        }
+
+        public var description: String {
+            "\(id)|\(String(reflecting: Act.self))"
         }
     }
 }
