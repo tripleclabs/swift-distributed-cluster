@@ -22,7 +22,12 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         public var requestTimeout: Duration = .seconds(10)
         public var heartbeatInterval: Duration = .seconds(2)
         public var heartbeatTimeout: Duration = .seconds(6)
-        public var logger: Logger
+        public var logging: LoggingSettings
+        public var logger: Logger {
+            get { logging.baseLogger }
+            set { logging.baseLogger = newValue }
+        }
+        public var plugins: PluginsSettings = PluginsSettings()
         public var autoLeaderElection: Cluster.AutoLeaderElectionSettings = .none
         #if SWIMDiscovery
         public var swim: SWIM.Settings = SWIM.Settings()
@@ -33,14 +38,14 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
 
         public init(nodeName: String) {
             self.nodeName = nodeName
-            self.logger = Logger(label: "cluster.\(nodeName)")
+            self.logging = LoggingSettings(baseLogger: Logger(label: "cluster.\(nodeName)"))
         }
 
         public init(name: String, host: String = "127.0.0.1", port: Int = 2552) {
             self.nodeName = name
             self.bindHost = host
             self.bindPort = port
-            self.logger = Logger(label: "cluster.\(name)")
+            self.logging = LoggingSettings(baseLogger: Logger(label: "cluster.\(name)"))
         }
     }
 
@@ -63,6 +68,7 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         var nextIncarnation: UInt64 = 1
         var isShuttingDown: Bool = false
         var clusterEventContinuations: [UUID: AsyncStream<Cluster.Event>.Continuation] = [:]
+        var hostedSingletonPassivators: [@Sendable () async -> Void] = []
     }
 
     public let name: String
@@ -84,6 +90,10 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
 
     public var cluster: ClusterControl {
         ClusterControl(system: self)
+    }
+
+    public var singleton: ClusterSingletonControl {
+        ClusterSingletonControl(system: self)
     }
 
     internal let state = Mutex(State())
@@ -168,6 +178,20 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
         }
     }
 
+    public convenience init(_ name: String, settings: ClusterSystemSettings) async {
+        do {
+            try await self.init(name) { $0 = settings }
+        } catch {
+            fatalError("ClusterSystem(\(name), settings:) failed to start: \(error)")
+        }
+    }
+
+    internal func registerHostedSingleton(_ passivate: @escaping @Sendable () async -> Void) {
+        state.withLock { s in
+            s.hostedSingletonPassivators.append(passivate)
+        }
+    }
+
     internal func makeClusterEventStream() -> AsyncStream<Cluster.Event> {
         let id = UUID()
         let (stream, continuation) = AsyncStream<Cluster.Event>.makeStream()
@@ -199,16 +223,22 @@ public final class ClusterSystem: Distributed::DistributedActorSystem, Service, 
     }
 
     public func shutdown() async {
-        let (alreadyShuttingDown, eventContinuations) = state.withLock { s -> (Bool, [AsyncStream<Cluster.Event>.Continuation]) in
-            if s.isShuttingDown { return (true, []) }
+        let (alreadyShuttingDown, eventContinuations, passivators) = state.withLock {
+            s -> (Bool, [AsyncStream<Cluster.Event>.Continuation], [@Sendable () async -> Void]) in
+            if s.isShuttingDown { return (true, [], []) }
             s.isShuttingDown = true
             let conts = Array(s.clusterEventContinuations.values)
             s.clusterEventContinuations.removeAll()
-            return (false, conts)
+            let passivators = s.hostedSingletonPassivators
+            s.hostedSingletonPassivators.removeAll()
+            return (false, conts, passivators)
         }
         guard !alreadyShuttingDown else { return }
 
         await withTaskCancellationShield {
+            for passivate in passivators {
+                await passivate()
+            }
             #if SWIMDiscovery
             await swimAdapter.shutdown()
             #endif

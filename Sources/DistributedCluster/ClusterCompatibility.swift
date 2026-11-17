@@ -5,9 +5,61 @@ import Logging
 public typealias ClusterSystemSettings = ClusterSystem.Settings
 
 extension ClusterSystem.Settings {
-    public var logging: Logger {
-        get { logger }
-        set { logger = newValue }
+    public struct LoggingSettings: Sendable {
+        public var baseLogger: Logger
+        public var logLevel: Logger.Level {
+            get { baseLogger.logLevel }
+            set { baseLogger.logLevel = newValue }
+        }
+
+        public init(baseLogger: Logger) {
+            self.baseLogger = baseLogger
+        }
+    }
+
+    public struct PluginsSettings: Sendable {
+        public mutating func install(plugin: any ClusterPlugin) {}
+    }
+}
+
+public protocol ClusterPlugin: Sendable {}
+
+public protocol ClusterSingleton: DistributedActor where ActorSystem == ClusterSystem {
+    func activateSingleton() async
+    func passivateSingleton() async
+}
+
+public struct ClusterSingletonPlugin: ClusterPlugin, Sendable {
+    public init() {}
+}
+
+public struct ClusterSingletonControl: Sendable {
+    private let system: ClusterSystem
+
+    internal init(system: ClusterSystem) {
+        self.system = system
+    }
+
+    @discardableResult
+    public func host<S: ClusterSingleton>(
+        name: String,
+        makeInstance: @Sendable (ClusterSystem) async throws -> S
+    ) async throws -> S {
+        let key = Reception.Key<S>(S.self, id: "singleton:\(name)")
+        if let existing = await system.receptionist.lookup(key).first {
+            return existing
+        }
+        let instance = try await makeInstance(system)
+        await system.receptionist.register(instance, with: key)
+        await instance.whenLocal { local in
+            await local.activateSingleton()
+        }
+        system.registerHostedSingleton {
+            await instance.whenLocal { local in
+                await local.passivateSingleton()
+            }
+        }
+        return instance
     }
 }
 
@@ -20,8 +72,9 @@ extension Cluster {
     public enum MemberStatus: Int, Sendable, Hashable, Comparable {
         case joining = 0
         case up = 1
-        case down = 2
-        case removed = 3
+        case leaving = 2
+        case down = 3
+        case removed = 4
 
         public static func < (lhs: MemberStatus, rhs: MemberStatus) -> Bool {
             lhs.rawValue < rhs.rawValue
@@ -46,6 +99,10 @@ extension Cluster {
 
         public func members(atLeast status: MemberStatus) -> [Member] {
             members.filter { $0.status >= status }
+        }
+
+        public func member(_ node: Cluster.Node) -> Member? {
+            members.first { $0.node == node }
         }
 
         public init(members: [Member]) {
